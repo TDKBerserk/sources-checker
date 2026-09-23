@@ -21,7 +21,7 @@ jobs:
         run: pip install aiohttp
 
       - name: Run link checker
-        run: python check_links.py sources_dedup.txt
+        run: python check_links.py sources.txt
 
       - name: Upload results
         uses: actions/upload-artifact@v4
