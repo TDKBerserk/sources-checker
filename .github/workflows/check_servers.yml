@@ -1,78 +1,302 @@
-name: Check servers (real tunnel, INCY-style)
+name: Check sources
 
 on:
-  workflow_dispatch: {}
+
+  workflow_dispatch:
+
   push:
     paths:
-      - "sources/**"
       - "sources.txt"
+      - "sources/**"
+      - "check_servers.py"
+      - "proxy_parsers.py"
+      - ".github/workflows/check_servers.yml"
+
   schedule:
-    - cron: "0 */6 * * *"   # раз в 6 часов — поменяй/убери по вкусу
+    - cron: "0 */6 * * *"
+
+
+env:
+
+  TOTAL_SHARDS: "12"
+
 
 jobs:
+
+
   check:
+
+
+    name: Check shard ${{ matrix.shard }}
+
     runs-on: ubuntu-latest
+
+    timeout-minutes: 350
+
+
+    strategy:
+
+      fail-fast: false
+
+      matrix:
+
+        shard:
+
+          - 0
+          - 1
+          - 2
+          - 3
+          - 4
+          - 5
+          - 6
+          - 7
+          - 8
+          - 9
+          - 10
+          - 11
+
+
     steps:
-      - name: Checkout repo
+
+
+      - name: Checkout repository
+
         uses: actions/checkout@v4
 
+
       - name: Set up Python
+
         uses: actions/setup-python@v5
+
         with:
+
           python-version: "3.11"
 
-      - name: Install Python deps
-        run: pip install requests
+
+      - name: Install dependencies
+
+        run: |
+
+          python -m pip install --upgrade pip
+
+          pip install requests
+
 
       - name: Install sing-box
+
         run: |
-          LATEST_TAG=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep '"tag_name"' | cut -d '"' -f4)
+
+          LATEST_TAG=$(curl -fsSL \
+            https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+            | grep '"tag_name"' \
+            | cut -d '"' -f4)
+
           VERSION=${LATEST_TAG#v}
-          curl -Lo sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/${LATEST_TAG}/sing-box-${VERSION}-linux-amd64.tar.gz"
+
+
+          curl -fL \
+            -o sing-box.tar.gz \
+            "https://github.com/SagerNet/sing-box/releases/download/${LATEST_TAG}/sing-box-${VERSION}-linux-amd64.tar.gz"
+
+
           tar -xzf sing-box.tar.gz
-          sudo mv sing-box-${VERSION}-linux-amd64/sing-box /usr/local/bin/sing-box
+
+
+          sudo mv \
+            "sing-box-${VERSION}-linux-amd64/sing-box" \
+            /usr/local/bin/sing-box
+
+
           sing-box version
 
-      - name: Run real server checker
-        run: python check_servers.py
+
+      - name: Check sources
+
         env:
-          CONCURRENCY: "15"
+
+          SHARD_INDEX: ${{ matrix.shard }}
+
+          TOTAL_SHARDS: ${{ env.TOTAL_SHARDS }}
+
+          OUTPUT_FILE: sources-shard-${{ matrix.shard }}.txt
+
+          REPORT_FILE: check-report-${{ matrix.shard }}.txt
+
+          CONCURRENCY: "24"
+
+          SUB_FETCH_CONCURRENCY: "40"
+
+          SUB_FETCH_TIMEOUT: "10"
+
           TEST_TIMEOUT: "5"
 
-      - name: Upload results as artifact
+          CHECKPOINT_EVERY: "200"
+
+        run: |
+
+          python check_servers.py
+
+
+      - name: Upload shard result
+
+        if: always()
+
         uses: actions/upload-artifact@v4
+
         with:
-          name: sources
+
+          name: checker-shard-${{ matrix.shard }}
+
+          path: |
+
+            sources-shard-${{ matrix.shard }}.txt
+
+            check-report-${{ matrix.shard }}.txt
+
+          if-no-files-found: warn
+
+
+
+  merge:
+
+
+    name: Merge sources
+
+    needs: check
+
+    if: ${{ needs.check.result == 'success' }}
+
+    runs-on: ubuntu-latest
+
+
+    steps:
+
+
+      - name: Checkout repository
+
+        uses: actions/checkout@v4
+
+
+      - name: Download shard results
+
+        uses: actions/download-artifact@v4
+
+        with:
+
+          pattern: checker-shard-*
+
+          path: shard-results
+
+          merge-multiple: false
+
+
+      - name: Merge sources.txt
+
+        run: |
+
+          python - <<'PY'
+
+          from pathlib import Path
+
+
+          root = Path(
+              "shard-results"
+          )
+
+
+          files = sorted(
+              root.glob(
+                  "checker-shard-*/sources-shard-*.txt"
+              )
+          )
+
+
+          result = []
+
+          seen = set()
+
+
+          for file in files:
+
+              for line in file.read_text(
+                  encoding="utf-8",
+                  errors="ignore"
+              ).splitlines():
+
+                  line = line.strip()
+
+
+                  if not line:
+                      continue
+
+
+                  if line in seen:
+                      continue
+
+
+                  seen.add(line)
+
+                  result.append(line)
+
+
+          Path(
+              "sources.txt"
+          ).write_text(
+              "\n".join(result)
+              + (
+                  "\n"
+                  if result
+                  else ""
+              ),
+              encoding="utf-8"
+          )
+
+
+          print(
+              f"Итоговых строк: "
+              f"{len(result)}"
+          )
+
+          PY
+
+
+      - name: Upload final sources.txt
+
+        uses: actions/upload-artifact@v4
+
+        with:
+
+          name: sources-final
+
           path: sources.txt
 
-      - name: Commit updated sources.txt to this repo
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add sources.txt
-          git diff --cached --quiet || git commit -m "auto: обновление sources.txt по итогам проверки"
-          git push
 
-      # --- Отправка результата в NotZapret | Bypass парсер ---
-      # Нужен Personal Access Token с правом записи в тот репозиторий,
-      # добавленный в Settings -> Secrets -> Actions как NOTZAPRET_PUSH_TOKEN.
-      # NOTZAPRET_REPO — "владелец/репозиторий".
-      # NOTZAPRET_SERVERS_DIR — папка внутри того репозитория, куда кладём
-      # результат (по умолчанию "servers"); файл внутри неё называем по
-      # имени этого репозитория-источника, чтобы несколько чекеров не
-      # затирали друг друга.
-      - name: Push results into NotZapret | Bypass (servers/ folder)
-        if: ${{ vars.NOTZAPRET_REPO != '' }}
-        env:
-          NOTZAPRET_REPO: ${{ vars.NOTZAPRET_REPO }}
-          NOTZAPRET_SERVERS_DIR: ${{ vars.NOTZAPRET_SERVERS_DIR || 'servers' }}
+      - name: Commit updated sources.txt
+
         run: |
-          git clone "https://x-access-token:${{ secrets.NOTZAPRET_PUSH_TOKEN }}@github.com/${NOTZAPRET_REPO}.git" target_repo
-          mkdir -p "target_repo/${NOTZAPRET_SERVERS_DIR}"
-          cp sources.txt "target_repo/${NOTZAPRET_SERVERS_DIR}/sources-checker.txt"
-          cd target_repo
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "${NOTZAPRET_SERVERS_DIR}/sources-checker.txt"
-          git diff --cached --quiet || git commit -m "auto: конфиги от sources-checker"
-          git diff --cached --quiet || git push
+
+          git config \
+            user.name \
+            "github-actions[bot]"
+
+
+          git config \
+            user.email \
+            "github-actions[bot]@users.noreply.github.com"
+
+
+          git add sources.txt
+
+
+          if git diff --cached --quiet; then
+
+            echo "Изменений в sources.txt нет."
+
+          else
+
+            git commit \
+              -m "auto: очистка sources.txt"
+
+            git push
+
+          fi
