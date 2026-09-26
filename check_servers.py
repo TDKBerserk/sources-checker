@@ -1,297 +1,1199 @@
 #!/usr/bin/env python3
 """
-Реальная проверка живости (INCY-style: HTTP GET через настоящий туннель
-sing-box) для источников из sources.txt и файлов в папке sources/.
+Проверка источников через реальный sing-box туннель.
 
-Логика по каждой строке-источнику:
-- Прямой конфиг (vless://, vmess://, trojan://, ss://):
-    жив -> оставляем как есть
-    мёртв -> убираем
-- Ссылка на подписку (http/https):
-    скачиваем, вытаскиваем из неё все конфиги, проверяем каждый.
-    * если ВСЕ конфиги внутри живы -> в итоговый файл идёт сама ссылка
-      на подписку без изменений (незачем её разбирать)
-    * если живы ЧАСТЬ конфигов -> подписку целиком выбрасываем,
-      но "вытягиваем" из неё живые конфиги и кладём их в итоговый
-      файл по отдельности (чтобы не терять рабочие серверы)
-    * если не живёт ни один -> строка целиком выбрасывается
+Логика:
 
-Результат — один-единственный файл sources.txt (перезаписывается в корне
-репозитория). Никакого деления на подпапки/протоколы.
+1. Прямой конфиг:
+   vless://
+   vmess://
+   trojan://
+   ss://
 
-Запуск:
-    pip install requests
-    (sing-box должен быть в PATH)
-    python check_servers.py
+   Живой  -> оставить
+   Мёртвый -> удалить
 
----
-Патч (parallel fetch + per-sub sampling):
-- Скачивание подписок было ПОСЛЕДОВАТЕЛЬНЫМ (for-цикл, один HTTP-запрос
-  за другим). При тысячах подписок это само по себе съедало часы ещё до
-  начала реальных sing-box-проверок. Теперь скачивание идёт пулом потоков
-  (SUB_FETCH_CONCURRENCY), как и сами проверки.
-- Добавлено ограничение MAX_CONFIGS_PER_SUB: если из одной подписки
-  вытянулось аномально много конфигов, берём случайную выборку размера
-  MAX_CONFIGS_PER_SUB вместо проверки всех (0 = без ограничения).
-- Добавлена глобальная дедупликация URI между подписками: один и тот же
-  конфиг, встретившийся в нескольких подписках, проверяется один раз.
-- Поднят дефолт CONCURRENCY для самих sing-box-проверок.
-- Добавлены чекпоинты: sources.txt дозаписывается частичным результатом
-  каждые CHECKPOINT_EVERY проверок, чтобы при отмене джобы результат не
-  терялся полностью.
+2. Подписка:
+   http://
+   https://
+
+   Успешно скачалась + есть хотя бы один живой конфиг
+       -> оставить ИМЕННО ССЫЛКУ НА ПОДПИСКУ
+
+   Успешно скачалась + 0 живых конфигов
+       -> удалить подписку
+
+   Не удалось скачать / timeout / HTTP ошибка
+       -> НЕ удалять подписку
+
+Никакие конфиги из подписки отдельно в sources.txt НЕ вытаскиваются.
+
+Результат:
+    sources.txt
+
+Отчёт:
+    check_report.txt
+
+Поддерживается шардинг для GitHub Actions.
 """
 
-import base64
+import concurrent.futures
+import hashlib
 import json
 import os
-import random
 import re
 import subprocess
 import sys
 import time
-import concurrent.futures
 from pathlib import Path
 
 import requests
 
 from proxy_parsers import parse_uri
 
+
+# ---------------------------------------------------------
+# Настройки
+# ---------------------------------------------------------
+
 SOURCES_ROOT = Path(".")
 SOURCES_DIR = Path("sources")
-OUTPUT_FILE = Path("sources.txt")
 
-TEST_URL = os.environ.get("TEST_URL", "https://www.gstatic.com/generate_204")
-TEST_TIMEOUT = float(os.environ.get("TEST_TIMEOUT", "5"))
-CONCURRENCY = int(os.environ.get("CONCURRENCY", "40"))
-SINGBOX_STARTUP_WAIT = float(os.environ.get("SINGBOX_STARTUP_WAIT", "0.6"))
+OUTPUT_FILE = Path(
+    os.environ.get(
+        "OUTPUT_FILE",
+        "sources.txt"
+    )
+)
 
-SUB_FETCH_TIMEOUT = float(os.environ.get("SUB_FETCH_TIMEOUT", "10"))
-SUB_FETCH_CONCURRENCY = int(os.environ.get("SUB_FETCH_CONCURRENCY", "30"))
-MAX_CONFIGS_PER_SUB = int(os.environ.get("MAX_CONFIGS_PER_SUB", "0"))  # 0 = без лимита
-CHECKPOINT_EVERY = int(os.environ.get("CHECKPOINT_EVERY", "200"))
+REPORT_FILE = Path(
+    os.environ.get(
+        "REPORT_FILE",
+        "check_report.txt"
+    )
+)
+
+SHARD_INDEX = int(
+    os.environ.get(
+        "SHARD_INDEX",
+        "0"
+    )
+)
+
+TOTAL_SHARDS = max(
+    1,
+    int(
+        os.environ.get(
+            "TOTAL_SHARDS",
+            "1"
+        )
+    )
+)
+
+TEST_URL = os.environ.get(
+    "TEST_URL",
+    "https://www.gstatic.com/generate_204"
+)
+
+TEST_TIMEOUT = float(
+    os.environ.get(
+        "TEST_TIMEOUT",
+        "5"
+    )
+)
+
+CONCURRENCY = int(
+    os.environ.get(
+        "CONCURRENCY",
+        "24"
+    )
+)
+
+SUB_FETCH_CONCURRENCY = int(
+    os.environ.get(
+        "SUB_FETCH_CONCURRENCY",
+        "40"
+    )
+)
+
+SUB_FETCH_TIMEOUT = float(
+    os.environ.get(
+        "SUB_FETCH_TIMEOUT",
+        "10"
+    )
+)
+
+SINGBOX_STARTUP_WAIT = float(
+    os.environ.get(
+        "SINGBOX_STARTUP_WAIT",
+        "0.6"
+    )
+)
+
+CHECKPOINT_EVERY = int(
+    os.environ.get(
+        "CHECKPOINT_EVERY",
+        "200"
+    )
+)
 
 BASE_PORT = 20000
-CONFIG_PREFIXES = ("vless://", "vmess://", "trojan://", "ss://")
-URI_PATTERN = re.compile(r"(?:vless|vmess|trojan|ss)://[^\s\"'<>]+")
+
+CONFIG_PREFIXES = (
+    "vless://",
+    "vmess://",
+    "trojan://",
+    "ss://",
+)
+
+URI_PATTERN = re.compile(
+    r"(?:vless|vmess|trojan|ss)://[^\s\"'<>]+"
+)
 
 
-def collect_source_lines() -> list[str]:
-    lines: list[str] = []
+# ---------------------------------------------------------
+# Чтение источников
+# ---------------------------------------------------------
+
+def collect_source_lines():
+    """
+    Читает sources.txt и, если существует,
+    дополнительные txt-файлы из sources/.
+
+    Для GitHub shard каждая исходная строка
+    попадает только в один shard.
+    """
+
+    lines = []
+
     root_sources = SOURCES_ROOT / "sources.txt"
-    if root_sources.exists():
-        lines += root_sources.read_text(encoding="utf-8", errors="ignore").splitlines()
-    if SOURCES_DIR.exists():
-        for f in sorted(SOURCES_DIR.glob("*.txt")):
-            lines += f.read_text(encoding="utf-8", errors="ignore").splitlines()
 
-    seen = set()
+    if root_sources.exists():
+
+        lines.extend(
+            root_sources.read_text(
+                encoding="utf-8",
+                errors="ignore"
+            ).splitlines()
+        )
+
+    if SOURCES_DIR.exists():
+
+        for file in sorted(
+            SOURCES_DIR.glob("*.txt")
+        ):
+
+            lines.extend(
+                file.read_text(
+                    encoding="utf-8",
+                    errors="ignore"
+                ).splitlines()
+            )
+
     result = []
-    for l in lines:
-        l = l.strip()
-        if not l or l.startswith("#") or l in seen:
+    seen = set()
+
+    for line in lines:
+
+        line = line.strip()
+
+        if not line:
             continue
-        seen.add(l)
-        result.append(l)
+
+        if line.startswith("#"):
+            continue
+
+        if line in seen:
+            continue
+
+        seen.add(line)
+        result.append(line)
+
+    # -----------------------------------------------------
+    # Шардинг
+    # -----------------------------------------------------
+
+    if TOTAL_SHARDS > 1:
+
+        sharded = []
+
+        for line in result:
+
+            value = int(
+                hashlib.sha1(
+                    line.encode(
+                        "utf-8",
+                        "ignore"
+                    )
+                ).hexdigest(),
+                16
+            )
+
+            if value % TOTAL_SHARDS == SHARD_INDEX:
+
+                sharded.append(line)
+
+        result = sharded
+
     return result
 
 
-def fetch_subscription(url: str) -> list[str]:
+# ---------------------------------------------------------
+# Загрузка подписки
+# ---------------------------------------------------------
+
+def fetch_subscription(url):
+    """
+    Возвращает:
+
+        ("ok", configs)
+
+    если подписка успешно скачалась,
+
+        ("error", [])
+
+    если скачать не удалось.
+    """
+
     try:
-        resp = requests.get(url, timeout=SUB_FETCH_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
-        resp.raise_for_status()
-        text = resp.text
-    except Exception as e:
-        print(f" [!] не удалось скачать подписку {url}: {e}", file=sys.stderr)
-        return []
+
+        response = requests.get(
+            url,
+            timeout=SUB_FETCH_TIMEOUT,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 "
+                    "(sources-checker)"
+                )
+            }
+        )
+
+        response.raise_for_status()
+
+        text = response.text
+
+    except Exception as exc:
+
+        print(
+            f"[SUB ERROR] {url} -> {exc}",
+            file=sys.stderr
+        )
+
+        # Очень важно:
+        # ошибка скачивания НЕ означает,
+        # что подписка мёртвая.
+        return "error", []
 
     stripped = text.strip()
-    decoded = None
-    try:
-        padding = "=" * (-len(stripped) % 4)
-        decoded = base64.b64decode(stripped + padding).decode("utf-8", errors="ignore")
-    except Exception:
-        decoded = None
 
     candidates = []
-    if decoded and "://" in decoded:
-        candidates = URI_PATTERN.findall(decoded)
-    if not candidates:
-        candidates = URI_PATTERN.findall(text)
 
+    # -----------------------------------------------------
+    # Сначала пробуем обычный текст
+    # -----------------------------------------------------
+
+    candidates.extend(
+        URI_PATTERN.findall(
+            text
+        )
+    )
+
+    # -----------------------------------------------------
+    # Потом Base64
+    # -----------------------------------------------------
+
+    try:
+
+        padding = "=" * (
+            -len(stripped) % 4
+        )
+
+        import base64
+
+        decoded = base64.b64decode(
+            stripped + padding
+        ).decode(
+            "utf-8",
+            errors="ignore"
+        )
+
+        candidates.extend(
+            URI_PATTERN.findall(
+                decoded
+            )
+        )
+
+    except Exception:
+        pass
+
+    # -----------------------------------------------------
+    # Дедупликация
+    # -----------------------------------------------------
+
+    configs = []
     seen = set()
-    uniq = []
-    for c in candidates:
-        if c not in seen:
-            seen.add(c)
-            uniq.append(c)
 
-    if MAX_CONFIGS_PER_SUB and len(uniq) > MAX_CONFIGS_PER_SUB:
-        uniq = random.sample(uniq, MAX_CONFIGS_PER_SUB)
+    for config in candidates:
 
-    return uniq
+        config = config.strip()
+
+        if not config:
+            continue
+
+        if config in seen:
+            continue
+
+        seen.add(config)
+        configs.append(config)
+
+    return "ok", configs
 
 
-def fetch_all_subscriptions(sub_urls: list[str]) -> dict[str, list[str]]:
-    """Параллельно скачивает все подписки вместо последовательного for-цикла."""
-    subs: dict[str, list[str]] = {}
-    if not sub_urls:
-        return subs
+# ---------------------------------------------------------
+# Параллельная загрузка подписок
+# ---------------------------------------------------------
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=SUB_FETCH_CONCURRENCY) as pool:
-        futures = {pool.submit(fetch_subscription, url): url for url in sub_urls}
+def fetch_all_subscriptions(urls):
+
+    result = {}
+
+    if not urls:
+        return result
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=SUB_FETCH_CONCURRENCY
+    ) as executor:
+
+        futures = {
+            executor.submit(
+                fetch_subscription,
+                url
+            ): url
+            for url in urls
+        }
+
         done = 0
-        for fut in concurrent.futures.as_completed(futures):
-            url = futures[fut]
+
+        for future in concurrent.futures.as_completed(
+            futures
+        ):
+
+            url = futures[future]
+
             try:
-                configs = fut.result()
-            except Exception as e:
-                print(f" [!] ошибка подписки {url}: {e}", file=sys.stderr)
+
+                status, configs = future.result()
+
+            except Exception as exc:
+
+                status = "error"
                 configs = []
-            subs[url] = configs
+
+                print(
+                    f"[SUB EXCEPTION] "
+                    f"{url} -> {exc}",
+                    file=sys.stderr
+                )
+
+            result[url] = (
+                status,
+                configs
+            )
+
             done += 1
-            print(f"[sub {done}/{len(sub_urls)}] {len(configs)} конфигов из {url}")
 
-    return subs
+            if status == "ok":
+
+                print(
+                    f"[SUB {done}/{len(urls)}] "
+                    f"{len(configs)} конфигов: "
+                    f"{url}"
+                )
+
+            else:
+
+                print(
+                    f"[SUB {done}/{len(urls)}] "
+                    f"ОШИБКА СКАЧИВАНИЯ: "
+                    f"{url}"
+                )
+
+    return result
 
 
-def build_singbox_config(outbound: dict, port: int) -> dict:
+# ---------------------------------------------------------
+# Sing-box
+# ---------------------------------------------------------
+
+def build_singbox_config(
+    outbound,
+    port
+):
+
     return {
-        "log": {"level": "error"},
+        "log": {
+            "level": "error"
+        },
+
         "inbounds": [
-            {"type": "mixed", "tag": "in", "listen": "127.0.0.1", "listen_port": port}
+            {
+                "type": "mixed",
+                "tag": "in",
+                "listen": "127.0.0.1",
+                "listen_port": port
+            }
         ],
-        "outbounds": [outbound, {"type": "direct", "tag": "direct"}],
+
+        "outbounds": [
+            outbound,
+            {
+                "type": "direct",
+                "tag": "direct"
+            }
+        ]
     }
 
 
-def check_one(uri: str, port: int) -> tuple[str, bool, str]:
-    """Возвращает (uri, ok, detail). Реальная проверка через sing-box-туннель."""
-    proto, outbound = parse_uri(uri)
+def check_one(
+    uri,
+    port
+):
+
+    protocol, outbound = parse_uri(
+        uri
+    )
+
     if not outbound:
-        return uri, False, "не распознан формат ссылки"
 
-    cfg = build_singbox_config(outbound, port)
-    cfg_path = Path(f"/tmp/sb_cfg_{port}.json")
-    cfg_path.write_text(json.dumps(cfg))
-
-    proc = None
-    try:
-        proc = subprocess.Popen(
-            ["sing-box", "run", "-c", str(cfg_path)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+        return (
+            uri,
+            False,
+            "не распознан формат"
         )
-        time.sleep(SINGBOX_STARTUP_WAIT)
-        if proc.poll() is not None:
-            return uri, False, "sing-box не запустился (плохой конфиг)"
+
+    config = build_singbox_config(
+        outbound,
+        port
+    )
+
+    config_path = Path(
+        f"/tmp/sb_cfg_{port}.json"
+    )
+
+    config_path.write_text(
+        json.dumps(
+            config,
+            ensure_ascii=False
+        ),
+        encoding="utf-8"
+    )
+
+    process = None
+
+    try:
+
+        process = subprocess.Popen(
+            [
+                "sing-box",
+                "run",
+                "-c",
+                str(config_path)
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+
+        time.sleep(
+            SINGBOX_STARTUP_WAIT
+        )
+
+        if process.poll() is not None:
+
+            return (
+                uri,
+                False,
+                "sing-box не запустился"
+            )
 
         proxies = {
-            "http": f"http://127.0.0.1:{port}",
-            "https": f"http://127.0.0.1:{port}",
+            "http":
+                f"http://127.0.0.1:{port}",
+
+            "https":
+                f"http://127.0.0.1:{port}"
         }
-        start = time.time()
-        resp = requests.get(TEST_URL, proxies=proxies, timeout=TEST_TIMEOUT)
-        latency_ms = int((time.time() - start) * 1000)
-        ok = resp.status_code < 400
-        return uri, ok, f"{resp.status_code} за {latency_ms}ms"
-    except Exception as e:
-        return uri, False, f"ошибка: {e}"
+
+        started = time.time()
+
+        response = requests.get(
+            TEST_URL,
+            proxies=proxies,
+            timeout=TEST_TIMEOUT
+        )
+
+        latency = int(
+            (
+                time.time()
+                - started
+            ) * 1000
+        )
+
+        if response.status_code < 400:
+
+            return (
+                uri,
+                True,
+                f"OK {response.status_code} "
+                f"{latency}ms"
+            )
+
+        return (
+            uri,
+            False,
+            f"HTTP {response.status_code}"
+        )
+
+    except Exception as exc:
+
+        return (
+            uri,
+            False,
+            str(exc)
+        )
+
     finally:
-        if proc is not None:
-            proc.terminate()
+
+        if process is not None:
+
+            process.terminate()
+
             try:
-                proc.wait(timeout=3)
+
+                process.wait(
+                    timeout=3
+                )
+
             except Exception:
-                proc.kill()
-        cfg_path.unlink(missing_ok=True)
+
+                process.kill()
+
+        config_path.unlink(
+            missing_ok=True
+        )
 
 
-def write_output(raw_lines: list[str], direct_entries: list[str],
-                  subs: dict[str, list[str]], results: dict[str, bool]) -> list[str]:
-    output_lines: list[str] = []
+# ---------------------------------------------------------
+# Проверка конфигов
+# ---------------------------------------------------------
+
+def check_configs(configs):
+
+    if not configs:
+        return {}
+
+    unique = []
+    seen = set()
+
+    for config in configs:
+
+        if config in seen:
+            continue
+
+        seen.add(config)
+        unique.append(config)
+
+    results = {}
+
+    print(
+        f"Конфигов для проверки: "
+        f"{len(unique)}"
+    )
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=CONCURRENCY
+    ) as executor:
+
+        futures = {}
+
+        for index, uri in enumerate(
+            unique
+        ):
+
+            port = (
+                BASE_PORT
+                + (
+                    index
+                    % max(
+                        CONCURRENCY,
+                        1
+                    )
+                )
+            )
+
+            future = executor.submit(
+                check_one,
+                uri,
+                port
+            )
+
+            futures[future] = uri
+
+        completed = 0
+
+        for future in concurrent.futures.as_completed(
+            futures
+        ):
+
+            uri, alive, detail = (
+                future.result()
+            )
+
+            results[uri] = alive
+
+            completed += 1
+
+            print(
+                f"[{completed}/{len(unique)}] "
+                f"{'OK' if alive else 'DEAD'} "
+                f"{detail}"
+            )
+
+    return results
+
+
+# ---------------------------------------------------------
+# Формирование результата
+# ---------------------------------------------------------
+
+def build_output(
+    raw_lines,
+    direct_results,
+    subscriptions,
+    config_results
+):
+
+    output = []
+
     for line in raw_lines:
-        if line.startswith(CONFIG_PREFIXES):
-            if results.get(line):
-                output_lines.append(line)
-        elif line.startswith(("http://", "https://")):
-            configs = subs.get(line, [])
-            if not configs:
+
+        # -------------------------------------------------
+        # Прямой конфиг
+        # -------------------------------------------------
+
+        if line.startswith(
+            CONFIG_PREFIXES
+        ):
+
+            if direct_results.get(
+                line,
+                False
+            ):
+
+                output.append(
+                    line
+                )
+
+            continue
+
+        # -------------------------------------------------
+        # Подписка
+        # -------------------------------------------------
+
+        if line.startswith(
+            (
+                "http://",
+                "https://"
+            )
+        ):
+
+            status, configs = (
+                subscriptions.get(
+                    line,
+                    (
+                        "error",
+                        []
+                    )
+                )
+            )
+
+            # -------------------------------------------------
+            # Не удалось скачать:
+            # оставляем ссылку, чтобы временная ошибка
+            # не уничтожила хороший источник.
+            # -------------------------------------------------
+
+            if status != "ok":
+
+                output.append(
+                    line
+                )
+
                 continue
-            alive = [c for c in configs if results.get(c)]
-            if len(alive) == len(configs):
-                output_lines.append(line)
-            elif alive:
-                output_lines.extend(alive)
 
-    OUTPUT_FILE.write_text("\n".join(output_lines) + ("\n" if output_lines else ""), encoding="utf-8")
-    return output_lines
+            # -------------------------------------------------
+            # Успешно скачали, но конфигов нет:
+            # удалить.
+            # -------------------------------------------------
 
+            if not configs:
+
+                continue
+
+            # -------------------------------------------------
+            # Есть хотя бы один живой конфиг:
+            # оставляем САМУ ПОДПИСКУ.
+            #
+            # Никаких vless/vmess/ss/trojan отдельно.
+            # -------------------------------------------------
+
+            alive_count = sum(
+                1
+                for config in configs
+                if config_results.get(
+                    config,
+                    False
+                )
+            )
+
+            if alive_count > 0:
+
+                output.append(
+                    line
+                )
+
+            # Если alive_count == 0:
+            # ничего не добавляем -> подписка удаляется.
+
+    # Дедупликация
+    final = []
+    seen = set()
+
+    for line in output:
+
+        if line in seen:
+            continue
+
+        seen.add(line)
+        final.append(line)
+
+    OUTPUT_FILE.write_text(
+        "\n".join(final)
+        + (
+            "\n"
+            if final
+            else ""
+        ),
+        encoding="utf-8"
+    )
+
+    return final
+
+
+# ---------------------------------------------------------
+# Отчёт
+# ---------------------------------------------------------
+
+def write_report(
+    raw_lines,
+    direct_results,
+    subscriptions,
+    config_results
+):
+
+    lines = []
+
+    lines.append(
+        f"SHARD: "
+        f"{SHARD_INDEX}/"
+        f"{TOTAL_SHARDS}"
+    )
+
+    lines.append(
+        f"INPUT: "
+        f"{len(raw_lines)}"
+    )
+
+    lines.append("")
+
+    # -----------------------------------------------------
+    # Подписки с рабочими конфигами
+    # -----------------------------------------------------
+
+    lines.append(
+        "[SUBSCRIPTIONS_KEPT]"
+    )
+
+    for url, (
+        status,
+        configs
+    ) in sorted(
+        subscriptions.items()
+    ):
+
+        if status != "ok":
+            continue
+
+        alive = sum(
+            1
+            for config in configs
+            if config_results.get(
+                config,
+                False
+            )
+        )
+
+        if alive > 0:
+
+            lines.append(
+                f"{url} | "
+                f"alive={alive}/"
+                f"{len(configs)}"
+            )
+
+    lines.append("")
+
+    # -----------------------------------------------------
+    # Подписки удалённые
+    # -----------------------------------------------------
+
+    lines.append(
+        "[SUBSCRIPTIONS_REMOVED]"
+    )
+
+    for url, (
+        status,
+        configs
+    ) in sorted(
+        subscriptions.items()
+    ):
+
+        if status != "ok":
+            continue
+
+        if not configs:
+
+            lines.append(
+                f"{url} | "
+                f"NO_CONFIGS"
+            )
+
+            continue
+
+        alive = sum(
+            1
+            for config in configs
+            if config_results.get(
+                config,
+                False
+            )
+        )
+
+        if alive == 0:
+
+            lines.append(
+                f"{url} | "
+                f"alive=0/"
+                f"{len(configs)}"
+            )
+
+    lines.append("")
+
+    # -----------------------------------------------------
+    # Ошибки скачивания
+    # -----------------------------------------------------
+
+    lines.append(
+        "[SUBSCRIPTIONS_FETCH_ERROR]"
+    )
+
+    for url, (
+        status,
+        configs
+    ) in sorted(
+        subscriptions.items()
+    ):
+
+        if status != "ok":
+
+            lines.append(
+                url
+            )
+
+    lines.append("")
+
+    # -----------------------------------------------------
+    # Прямые конфиги
+    # -----------------------------------------------------
+
+    lines.append(
+        "[DIRECT_CONFIGS_REMOVED]"
+    )
+
+    for uri, alive in sorted(
+        direct_results.items()
+    ):
+
+        if not alive:
+
+            lines.append(
+                uri
+            )
+
+    REPORT_FILE.write_text(
+        "\n".join(lines)
+        + "\n",
+        encoding="utf-8"
+    )
+
+
+# ---------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------
 
 def main():
-    raw_lines = collect_source_lines()
-    print(f"Источников в списке: {len(raw_lines)}")
+
+    raw_lines = (
+        collect_source_lines()
+    )
+
+    print(
+        f"Источников этого shard: "
+        f"{len(raw_lines)}"
+    )
+
     if not raw_lines:
-        print("Нечего проверять — пусто в sources.txt и в sources/")
+
+        OUTPUT_FILE.write_text(
+            "",
+            encoding="utf-8"
+        )
+
+        REPORT_FILE.write_text(
+            "Пустой shard\n",
+            encoding="utf-8"
+        )
+
         return
 
-    direct_entries: list[str] = []
-    sub_urls: list[str] = []
+    # -----------------------------------------------------
+    # Прямые конфиги
+    # -----------------------------------------------------
 
-    for line in raw_lines:
-        if line.startswith(CONFIG_PREFIXES):
-            direct_entries.append(line)
-        elif line.startswith(("http://", "https://")):
-            sub_urls.append(line)
+    direct_entries = [
+        line
+        for line in raw_lines
+        if line.startswith(
+            CONFIG_PREFIXES
+        )
+    ]
+
+    # -----------------------------------------------------
+    # Подписки
+    # -----------------------------------------------------
+
+    subscription_urls = [
+        line
+        for line in raw_lines
+        if line.startswith(
+            (
+                "http://",
+                "https://"
+            )
+        )
+    ]
+
+    print(
+        f"Прямых конфигов: "
+        f"{len(direct_entries)}"
+    )
+
+    print(
+        f"Подписок: "
+        f"{len(subscription_urls)}"
+    )
+
+    # -----------------------------------------------------
+    # Скачиваем подписки
+    # -----------------------------------------------------
+
+    subscriptions = (
+        fetch_all_subscriptions(
+            subscription_urls
+        )
+    )
+
+    # -----------------------------------------------------
+    # Собираем все конфиги подписок
+    # -----------------------------------------------------
+
+    subscription_configs = []
+
+    for status, configs in (
+        subscriptions.values()
+    ):
+
+        if status != "ok":
+            continue
+
+        subscription_configs.extend(
+            configs
+        )
+
+    # -----------------------------------------------------
+    # Проверяем прямые + подписочные конфиги
+    # -----------------------------------------------------
+
+    all_configs = (
+        direct_entries
+        + subscription_configs
+    )
+
+    unique_configs = []
+    seen = set()
+
+    for config in all_configs:
+
+        if config in seen:
+            continue
+
+        seen.add(config)
+
+        unique_configs.append(
+            config
+        )
+
+    print(
+        f"Уникальных конфигов "
+        f"для проверки: "
+        f"{len(unique_configs)}"
+    )
+
+    config_results = (
+        check_configs(
+            unique_configs
+        )
+    )
+
+    # -----------------------------------------------------
+    # Результаты прямых конфигов
+    # -----------------------------------------------------
+
+    direct_results = {
+        uri:
+            config_results.get(
+                uri,
+                False
+            )
+        for uri in direct_entries
+    }
+
+    # -----------------------------------------------------
+    # Сохраняем sources.txt
+    # -----------------------------------------------------
+
+    final = build_output(
+        raw_lines,
+        direct_results,
+        subscriptions,
+        config_results
+    )
+
+    # -----------------------------------------------------
+    # Отчёт
+    # -----------------------------------------------------
+
+    write_report(
+        raw_lines,
+        direct_results,
+        subscriptions,
+        config_results
+    )
+
+    # -----------------------------------------------------
+    # Статистика
+    # -----------------------------------------------------
+
+    kept_subs = 0
+    removed_subs = 0
+    fetch_errors = 0
+
+    for status, configs in (
+        subscriptions.values()
+    ):
+
+        if status != "ok":
+
+            fetch_errors += 1
+            continue
+
+        alive = sum(
+            1
+            for config in configs
+            if config_results.get(
+                config,
+                False
+            )
+        )
+
+        if alive > 0:
+
+            kept_subs += 1
+
         else:
-            print(f" [?] непонятная строка, пропускаю: {line[:60]}")
 
-    print(f"Подписок для скачивания: {len(sub_urls)} (параллельно, {SUB_FETCH_CONCURRENCY} потоков)")
-    subs = fetch_all_subscriptions(sub_urls)
+            removed_subs += 1
 
-    # Глобальная дедупликация: один и тот же конфиг может встречаться
-    # и как прямая запись, и в нескольких подписках сразу — проверяем один раз.
-    uri_owners: dict[str, list[str | None]] = {}
-    for uri in direct_entries:
-        uri_owners.setdefault(uri, []).append(None)
-    for sub_url, configs in subs.items():
-        for uri in configs:
-            uri_owners.setdefault(uri, []).append(sub_url)
+    dead_direct = sum(
+        1
+        for alive in direct_results.values()
+        if not alive
+    )
 
-    tasks = list(uri_owners.keys())
-    total_raw = len(direct_entries) + sum(len(c) for c in subs.values())
-    print(f"Всего конфигов для реальной проверки: {len(tasks)} (без дублей, было бы {total_raw})")
+    print("")
+    print(
+        "=============================="
+    )
+    print(
+        "ПРОВЕРКА ЗАВЕРШЕНА"
+    )
+    print(
+        "=============================="
+    )
 
-    results: dict[str, bool] = {}
-    if tasks:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-            futures = {
-                pool.submit(check_one, uri, BASE_PORT + i): uri
-                for i, uri in enumerate(tasks)
-            }
-            done = 0
-            for fut in concurrent.futures.as_completed(futures):
-                uri, ok, detail = fut.result()
-                results[uri] = ok
-                done += 1
-                status = "OK  " if ok else "DEAD"
-                print(f"[{done}/{len(tasks)}] {status} {detail} {uri[:70]}")
+    print(
+        f"Подписок оставлено: "
+        f"{kept_subs}"
+    )
 
-                if CHECKPOINT_EVERY and done % CHECKPOINT_EVERY == 0:
-                    write_output(raw_lines, direct_entries, subs, results)
-                    print(f"  [checkpoint] промежуточный sources.txt сохранён ({done}/{len(tasks)})")
+    print(
+        f"Подписок удалено: "
+        f"{removed_subs}"
+    )
 
-    output_lines = write_output(raw_lines, direct_entries, subs, results)
+    print(
+        f"Ошибок скачивания: "
+        f"{fetch_errors}"
+    )
 
-    total_subs = len(subs)
-    fully_alive_subs = sum(1 for u, c in subs.items() if c and all(results.get(x) for x in c))
-    partial_subs = sum(1 for u, c in subs.items() if c and 0 < sum(results.get(x, False) for x in c) < len(c))
-    dead_subs = total_subs - fully_alive_subs - partial_subs
+    print(
+        f"Прямых конфигов удалено: "
+        f"{dead_direct}"
+    )
 
-    print(f"\nГотово: {len(output_lines)} строк в итоговом sources.txt")
-    print(f"  подписок целиком живых: {fully_alive_subs}")
-    print(f"  подписок частично живых (вытянуты рабочие конфиги): {partial_subs}")
-    print(f"  подписок мёртвых/пустых: {dead_subs}")
-    print(f"  прямых конфигов живых: {sum(1 for u in direct_entries if results.get(u))}/{len(direct_entries)}")
+    print(
+        f"Итоговых строк: "
+        f"{len(final)}"
+    )
+
+    print(
+        f"Файл: "
+        f"{OUTPUT_FILE}"
+    )
+
+    print(
+        f"Отчёт: "
+        f"{REPORT_FILE}"
+    )
 
 
 if __name__ == "__main__":
